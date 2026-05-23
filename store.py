@@ -1,86 +1,103 @@
 # -*- coding: utf-8 -*-
-"""store — 자료실/관리시스템 저장소 (SQLite + BLOB).
-pptx 파일과 메타데이터를 단일 .db에 저장 → 단일 인스턴스 배포에서 팀이 공유.
-같은 제목으로 저장하면 version 자동 증가(버전 관리).
-영구 보존하려면 PPT_DB 환경변수로 영구 디스크 경로 지정(HF/Render).
-Streamlit Cloud는 파일시스템이 휘발성이라 재시작 시 초기화됨."""
-import os, sqlite3, time
+"""store — 자료실 저장소 (SQLAlchemy). DATABASE_URL 있으면 PostgreSQL(영구·공유),
+없으면 로컬 SQLite. 같은 제목 저장 시 version 자동 증가(버전관리).
+파일은 BLOB/BYTEA로 DB에 저장 → 백업 한 곳(DB)으로 끝."""
+import os, time
+from sqlalchemy import (create_engine, MetaData, Table, Column, Integer, String,
+                        Float, LargeBinary, select, insert, delete as sa_delete, func)
 
-DB = os.environ.get("PPT_DB", os.path.join(os.path.dirname(__file__), "library.db"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    DATABASE_URL = "sqlite:///" + os.path.join(os.path.dirname(__file__), "library.db")
+if DATABASE_URL.startswith("postgres://"):              # Heroku식 URL 정규화
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+_meta = MetaData()
+decks = Table(
+    "decks", _meta,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("title", String(500), nullable=False),
+    Column("theme", String(50)), Column("page", String(20)), Column("template", String(20)),
+    Column("version", Integer), Column("created_at", Float),
+    Column("owner", String(200)), Column("filename", String(500)),
+    Column("data", LargeBinary),
+)
 
-def _conn():
-    c = sqlite3.connect(DB, timeout=10)
-    c.execute("""CREATE TABLE IF NOT EXISTS decks(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        theme TEXT, page TEXT, template TEXT,
-        version INTEGER, created_at REAL,
-        owner TEXT, filename TEXT, data BLOB)""")
-    return c
+_ready = False
+def _init():
+    """DB 준비(테이블 생성). Postgres 컨테이너 기동 지연 대비 재시도."""
+    global _ready
+    if _ready:
+        return
+    last = None
+    for _ in range(15):
+        try:
+            _meta.create_all(engine)
+            _ready = True
+            return
+        except Exception as e:
+            last = e
+            time.sleep(2)
+    raise last
 
 
 def save(title, data, filename, theme="", page="", template="", owner=""):
-    c = _conn()
-    try:
-        v = c.execute("SELECT COALESCE(MAX(version),0)+1 FROM decks WHERE title=?", (title,)).fetchone()[0]
-        c.execute("""INSERT INTO decks(title,theme,page,template,version,created_at,owner,filename,data)
-                     VALUES(?,?,?,?,?,?,?,?,?)""",
-                  (title, theme, page, template, v, time.time(), owner, filename, sqlite3.Binary(data)))
-        c.commit()
-        return v
-    finally:
-        c.close()
+    _init()
+    with engine.begin() as c:
+        v = c.execute(select(func.coalesce(func.max(decks.c.version), 0) + 1)
+                      .where(decks.c.title == title)).scalar() or 1
+        c.execute(insert(decks).values(
+            title=title, theme=theme, page=page, template=template,
+            version=int(v), created_at=time.time(), owner=owner,
+            filename=filename, data=data))
+    return int(v)
 
 
 def list_decks(query="", latest_only=False):
-    c = _conn()
-    try:
-        rows = c.execute("""SELECT id,title,theme,page,template,version,created_at,owner,filename
-                            FROM decks WHERE title LIKE ? ORDER BY created_at DESC""",
-                         (f"%{query}%",)).fetchall()
-        if latest_only:
-            seen, out = set(), []
-            for r in rows:
-                if r[1] in seen:
-                    continue
-                seen.add(r[1]); out.append(r)
-            return out
-        return rows
-    finally:
-        c.close()
+    _init()
+    with engine.connect() as c:
+        rows = c.execute(
+            select(decks.c.id, decks.c.title, decks.c.theme, decks.c.page, decks.c.template,
+                   decks.c.version, decks.c.created_at, decks.c.owner, decks.c.filename)
+            .where(decks.c.title.like(f"%{query}%"))
+            .order_by(decks.c.created_at.desc())).all()
+    rows = [tuple(r) for r in rows]
+    if latest_only:
+        seen, out = set(), []
+        for r in rows:
+            if r[1] in seen:
+                continue
+            seen.add(r[1]); out.append(r)
+        return out
+    return rows
 
 
 def versions(title):
-    c = _conn()
-    try:
-        return c.execute("""SELECT id,version,created_at,owner,filename FROM decks
-                            WHERE title=? ORDER BY version DESC""", (title,)).fetchall()
-    finally:
-        c.close()
+    _init()
+    with engine.connect() as c:
+        rows = c.execute(
+            select(decks.c.id, decks.c.version, decks.c.created_at, decks.c.owner, decks.c.filename)
+            .where(decks.c.title == title).order_by(decks.c.version.desc())).all()
+    return [tuple(r) for r in rows]
 
 
 def get(deck_id):
-    c = _conn()
-    try:
-        return c.execute("SELECT filename,data FROM decks WHERE id=?", (deck_id,)).fetchone()
-    finally:
-        c.close()
+    _init()
+    with engine.connect() as c:
+        r = c.execute(select(decks.c.filename, decks.c.data).where(decks.c.id == deck_id)).first()
+    return (r[0], bytes(r[1])) if r else None
 
 
 def delete(deck_id):
-    c = _conn()
-    try:
-        c.execute("DELETE FROM decks WHERE id=?", (deck_id,)); c.commit()
-    finally:
-        c.close()
+    _init()
+    with engine.begin() as c:
+        c.execute(sa_delete(decks).where(decks.c.id == deck_id))
 
 
 def stats():
-    c = _conn()
-    try:
-        n = c.execute("SELECT COUNT(*) FROM decks").fetchone()[0]
-        t = c.execute("SELECT COUNT(DISTINCT title) FROM decks").fetchone()[0]
-        return {"files": n, "titles": t}
-    finally:
-        c.close()
+    _init()
+    with engine.connect() as c:
+        n = c.execute(select(func.count()).select_from(decks)).scalar() or 0
+        t = c.execute(select(func.count(func.distinct(decks.c.title)))).scalar() or 0
+    return {"files": int(n), "titles": int(t)}
