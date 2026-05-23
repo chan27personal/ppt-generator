@@ -8,6 +8,7 @@ env/
 
 # 생성/테스트 산출물
 *.pptx
+*.db
 out/
 
 # Streamlit
