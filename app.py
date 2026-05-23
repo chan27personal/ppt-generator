@@ -4,8 +4,17 @@
 - 자료실: 업로드·검색·버전관리·다운로드·삭제 (단일 인스턴스 공유)
 실행:  streamlit run app.py
 """
-import datetime as _dt
+import os, datetime as _dt
 import streamlit as st
+
+# Streamlit Cloud의 secrets(TOML)에 DATABASE_URL을 넣으면 환경변수로 넘겨준다.
+# (store.py는 DATABASE_URL 환경변수를 읽어 Supabase/PostgreSQL에 연결 → 자료실 영구화)
+try:
+    if "DATABASE_URL" in st.secrets:
+        os.environ["DATABASE_URL"] = str(st.secrets["DATABASE_URL"])
+except Exception:
+    pass
+
 import pptgen, preview, store
 
 st.set_page_config(page_title="PPT 자동 생성", page_icon="📑", layout="wide")
