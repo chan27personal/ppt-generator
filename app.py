@@ -57,6 +57,11 @@ with st.sidebar:
     st.divider()
     s = store.stats()
     st.caption(f"📚 자료실: 파일 {s['files']}개 · 제목 {s['titles']}종")
+    _db_url = os.environ.get("DATABASE_URL", "")
+    if _db_url.startswith("postgres"):
+        st.caption("🔌 DB: **Postgres (영구)** ✅")
+    else:
+        st.caption("🔌 DB: SQLite (임시) — DATABASE_URL 미설정")
 
 st.title("📑 PPT 자동 생성기")
 
